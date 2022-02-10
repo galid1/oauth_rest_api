@@ -1,5 +1,6 @@
 package com.galid.oauth_login_rest_api.controller
 
+import com.fasterxml.jackson.databind.ObjectMapper
 import com.galid.oauth_login_rest_api.application.dto.GetAccessTokenResponse
 import com.galid.oauth_login_rest_api.application.dto.GoogleDto
 import com.galid.oauth_login_rest_api.application.dto.KakaoDto
@@ -14,15 +15,23 @@ import com.galid.oauth_login_rest_api.constants.Constants.SupportSocials
 import com.galid.oauth_login_rest_api.constants.Constants.SupportSocials.*
 import org.springframework.http.HttpEntity
 import org.springframework.http.HttpHeaders
+import org.springframework.http.HttpHeaders.*
 import org.springframework.http.HttpMethod
 import org.springframework.http.MediaType
+import org.springframework.http.MediaType.*
 import org.springframework.util.LinkedMultiValueMap
 import org.springframework.web.bind.annotation.*
 import org.springframework.web.client.RestTemplate
+import org.springframework.web.reactive.function.BodyInserter
+import org.springframework.web.reactive.function.BodyInserters
+import org.springframework.web.reactive.function.client.WebClient
 
 @RestController
 @RequestMapping("/oauth/callback")
-class OauthCallbackController {
+class OauthCallbackController(
+    private val webClient: WebClient,
+    private val objectMapper: ObjectMapper
+) {
     @GetMapping("/{social_name}")
     fun socialLoginCallback(
         @PathVariable("social_name") socialName: String,
@@ -36,7 +45,7 @@ class OauthCallbackController {
         }
 
         val social = try {
-            valueOf(socialName.uppercase())
+            SupportSocials.valueOf(socialName.uppercase())
         } catch (e: IllegalArgumentException) {
             throw RuntimeException("지원하지 않는 Social입니다.")
         }
@@ -57,30 +66,12 @@ class OauthCallbackController {
         social: SupportSocials,
         accessToken: String
     ): String {
-        val headers = LinkedMultiValueMap<String, String>()
-        headers[HttpHeaders.AUTHORIZATION] = "Bearer ${accessToken}"
-
-        val httpClient = RestTemplate()
-
-        val getUserEmailApiHostUri = when(social) {
-            KAKAO -> KAKAO_GET_EMAIL_API_HOST_URI
-            NAVER -> NAVER_GET_EMAIL_API_HOST_URI
-            GOOGLE -> GOOGLE_GET_EMAIL_API_HOST_URI
-        }
-
-        val resultType = when(social) {
-            KAKAO -> KakaoDto.GetUserAccountResponse::class.java
-            NAVER -> NaverDto.GetUserAccountResponse::class.java
-            GOOGLE -> GoogleDto.GetUserAccountResponse::class.java
-        }
-
-        val result = httpClient.exchange(
-            getUserEmailApiHostUri,
-            HttpMethod.GET,
-            HttpEntity<Void>(HttpHeaders(headers)),
-            resultType,
-            null
-        ).body
+        val result = webClient.get()
+            .uri(getApiHostUri(social))
+            .header(AUTHORIZATION, "Bearer $accessToken")
+            .retrieve()
+            .bodyToMono(getResultType(social))
+            .block()
 
         return when(social) {
             KAKAO -> {
@@ -98,73 +89,69 @@ class OauthCallbackController {
         }
     }
 
-    internal fun getAccessToken(
+    private fun getResultType(social: SupportSocials) = when (social) {
+        KAKAO -> KakaoDto.GetUserAccountResponse::class.java
+        NAVER -> NaverDto.GetUserAccountResponse::class.java
+        GOOGLE -> GoogleDto.GetUserAccountResponse::class.java
+    }
+
+    private fun getApiHostUri(social: SupportSocials) = when (social) {
+        KAKAO -> KAKAO_GET_EMAIL_API_HOST_URI
+        NAVER -> NAVER_GET_EMAIL_API_HOST_URI
+        GOOGLE -> GOOGLE_GET_EMAIL_API_HOST_URI
+    }
+
+    private fun getAccessToken(
         social: SupportSocials,
         code: String,
         state: String?
     ): String {
-        val getAccessTokenHttpRequest = makeGetAccessTokenHttpRequest(
+        val requestBody = makeGetAccessTokenHttpRequestBody(
             social = social,
             code = code,
             state = state
         )
 
-        val httpClient = RestTemplate()
+        var webClient = webClient.post()
+            .uri(getAccessTokenUri(social))
+            .body(BodyInserters.fromValue(requestBody))
 
-        val getAccessTokenResult = when (social) {
-            KAKAO -> {
-                httpClient.postForEntity(
-                    KAKAO_GET_ACCESS_TOKEN_URI,
-                    getAccessTokenHttpRequest,
-                    GetAccessTokenResponse::class.java,
-                )
-            }
-            NAVER -> {
-                httpClient.postForEntity(
-                    NAVER_GET_ACCESS_TOKEN_URI,
-                    getAccessTokenHttpRequest,
-                    GetAccessTokenResponse::class.java
-                )
-            }
-            GOOGLE -> {
-                httpClient.postForEntity(
-                    GOOGLE_GET_ACCESS_TOKEN_URI,
-                    getAccessTokenHttpRequest,
-                    GetAccessTokenResponse::class.java
-                )
-            }
+        if (social == KAKAO || social == NAVER) {
+            webClient = webClient
+                .header(CONTENT_TYPE, APPLICATION_FORM_URLENCODED_VALUE)
         }
-            .body
-            ?: throw RuntimeException("access Token을 가져오는 과정에서 exception이 발생했습니다.")
 
-        return getAccessTokenResult
-            .access_token
-            ?: throw RuntimeException(getAccessTokenResult.error ?: "알 수 없는 오류로 access Token을 가져오지 못했습니다.")
+        return webClient
+            .retrieve()
+            .bodyToMono(GetAccessTokenResponse::class.java)
+            .block()
+            ?.access_token
+            ?: throw RuntimeException("Resource Server로 AccessToken 요청에 실패했습니다.")
     }
 
-    internal fun makeGetAccessTokenHttpRequest(
+    private fun getAccessTokenUri(social: SupportSocials) =
+        when (social) {
+            KAKAO -> KAKAO_GET_ACCESS_TOKEN_URI
+            NAVER -> NAVER_GET_ACCESS_TOKEN_URI
+            GOOGLE -> GOOGLE_GET_ACCESS_TOKEN_URI
+        }
+
+    internal fun makeGetAccessTokenHttpRequestBody(
         social: SupportSocials,
         code: String,
         state: String?
-    ): HttpEntity<Any> {
+    ): String {
         return when (social) {
             KAKAO -> {
-                val headers = LinkedMultiValueMap<String, String>()
-                headers[HttpHeaders.CONTENT_TYPE] = MediaType.APPLICATION_FORM_URLENCODED_VALUE
-
-                val body = KakaoDto.GetAccessTokenRequest(code = code, state = state)
-                HttpEntity(body.toString(), headers)
+                KakaoDto.GetAccessTokenRequest(code = code, state = state).toString()
             }
             NAVER -> {
-                val headers = LinkedMultiValueMap<String, String>()
-                headers[HttpHeaders.CONTENT_TYPE] = MediaType.APPLICATION_FORM_URLENCODED_VALUE
-
-                val body = NaverDto.GetAccessTokenRequest(code = code, state = state)
-                HttpEntity(body.toString(), headers)
+                NaverDto.GetAccessTokenRequest(code = code, state = state).toString()
             }
             GOOGLE -> {
-                val body = GoogleDto.GetAccessTokenRequest(code = code, state = state)
-                HttpEntity(body)
+                objectMapper.writeValueAsString(
+                    GoogleDto.GetAccessTokenRequest(code = code, state = state)
+                )
             }
         }
     }
